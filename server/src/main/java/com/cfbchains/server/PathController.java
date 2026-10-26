@@ -20,8 +20,13 @@ public class PathController {
         return pathfinderService.getWinsGraph();
     }
 
-    @GetMapping("/api/path")
-    public Map<String, List<String>> path(@RequestParam String start, @RequestParam String end) {
-        return Map.of("path", pathfinderService.findShortestPath(start, end));
+    @GetMapping("/api/teams")
+    public List<String> teams() {
+        return pathfinderService.getTeams();
+    }
+
+    @GetMapping("/api/chain")
+    public List<PathfinderService.ChainGame> chain(@RequestParam String start, @RequestParam String target) {
+        return pathfinderService.findShortestChain(start, target);
     }
 }

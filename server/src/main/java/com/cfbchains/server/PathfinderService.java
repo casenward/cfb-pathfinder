@@ -1,6 +1,7 @@
 package com.cfbchains.server;
 
-import java.time.Year;
+import java.time.Instant;
+import java.time.ZoneId;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -14,59 +15,88 @@ import java.util.TreeMap;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
 
 @Service
 public class PathfinderService {
 
-    // Each team maps to the list of teams it has beaten.
-    private final Map<String, List<String>> winsGraph = new HashMap<>();
+    // Game dates are shown in US Eastern time, so late West Coast kickoffs keep their local date.
+    private static final ZoneId GAME_ZONE = ZoneId.of("America/New_York");
 
-    private final RestClient cfbdClient;
+    // One link in a chain: a single game result. date is formatted like 2026-10-04.
+    public record ChainGame(String winner, String loser, int winnerPoints, int loserPoints, String date) {}
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     private record Team(String school) {}
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    private record Game(String homeTeam, String awayTeam, Integer homePoints, Integer awayPoints, boolean completed) {}
+    private record Game(String homeTeam, String awayTeam, Integer homePoints, Integer awayPoints,
+                        boolean completed, String startDate) {}
 
-    public PathfinderService(@Value("${URL:https://api.collegefootballdata.com}") String apiUrl, @Value("${API_KEY}") String apiKey) {
+    private final RestClient cfbdClient;
+    private final int season;
+
+    // Both are swapped out whole on each refresh, so searches never see a half-built graph.
+    private volatile List<String> fbsTeams = List.of();
+    // Each team maps to the games it has won.
+    private volatile Map<String, List<ChainGame>> winsGraph = Map.of();
+
+    public PathfinderService(@Value("${URL:https://api.collegefootballdata.com}") String apiUrl,
+                             @Value("${API_KEY}") String apiKey,
+                             @Value("${SEASON:2026}") int season) {
         this.cfbdClient = RestClient.builder()
                 .baseUrl(apiUrl)
                 .defaultHeader("Authorization", "Bearer " + apiKey)
                 .build();
+        this.season = season;
     }
 
-    // Builds winsGraph from game results (e.g. pulled from the CFBD API).
+    // Reloads teams and games on startup, then every Monday morning after the weekend's games.
     @PostConstruct
-    private void buildGraph() {
+    @Scheduled(cron = "0 0 6 * * MON", zone = "America/New_York")
+    public void refresh() {
+        List<String> teams = fetchTeams();
+        Map<String, List<ChainGame>> graph = buildGraph(new HashSet<>(teams));
+        fbsTeams = teams;
+        winsGraph = graph;
+    }
+
+    // Builds the wins graph from completed games where both teams are FBS.
+    private Map<String, List<ChainGame>> buildGraph(Set<String> fbs) {
         // One request returns every game of the season, so there's no need to query each team.
         Game[] games = cfbdClient.get()
-                .uri("/games?year={year}&seasonType=both", Year.now().getValue())
+                .uri("/games?year={year}&seasonType=both", season)
                 .retrieve()
                 .body(Game[].class);
 
+        Map<String, List<ChainGame>> graph = new HashMap<>();
         if (games == null) {
-            return;
+            return graph;
         }
         for (Game game : games) {
-            // Skip games that haven't been played yet, and ties.
+            // Skip games that haven't been played yet, games against non-FBS teams, and ties.
             if (!game.completed() || game.homePoints() == null || game.awayPoints() == null) {
                 continue;
             }
+            if (!fbs.contains(game.homeTeam()) || !fbs.contains(game.awayTeam())) {
+                continue;
+            }
+            String date = Instant.parse(game.startDate()).atZone(GAME_ZONE).toLocalDate().toString();
             if (game.homePoints() > game.awayPoints()) {
-                addWin(game.homeTeam(), game.awayTeam());
+                addWin(graph, new ChainGame(game.homeTeam(), game.awayTeam(), game.homePoints(), game.awayPoints(), date));
             } else if (game.awayPoints() > game.homePoints()) {
-                addWin(game.awayTeam(), game.homeTeam());
+                addWin(graph, new ChainGame(game.awayTeam(), game.homeTeam(), game.awayPoints(), game.homePoints(), date));
             }
         }
+        return graph;
     }
 
-    // Returns the names of all FBS teams for the current season.
+    // Returns the names of all FBS teams for the season, sorted A to Z.
     private List<String> fetchTeams() {
         Team[] teams = cfbdClient.get()
-                .uri("/teams/fbs")
+                .uri("/teams/fbs?year={year}", season)
                 .retrieve()
                 .body(Team[].class);
 
@@ -76,59 +106,66 @@ public class PathfinderService {
                 names.add(team.school());
             }
         }
+        Collections.sort(names);
         return names;
     }
 
-    // Returns the shortest chain of wins from startTeam to endTeam,
-    // e.g. [startTeam, ..., endTeam], or an empty list if no path exists.
-    public List<String> findShortestPath(String startTeam, String endTeam) {
+    public List<String> getTeams() {
+        return fbsTeams;
+    }
+
+    // Returns the games in the shortest chain of wins from startTeam to endTeam,
+    // in chain order, or an empty list if no chain exists.
+    public List<ChainGame> findShortestChain(String startTeam, String endTeam) {
         startTeam = startTeam.trim();
         endTeam = endTeam.trim();
+        Map<String, List<ChainGame>> graph = winsGraph;
 
         Queue<String> queue = new ArrayDeque<>();
         queue.add(startTeam);
         Set<String> visited = new HashSet<>();
         visited.add(startTeam);
-        Map<String, String> cameFrom = new HashMap<>();
+        Map<String, ChainGame> cameFrom = new HashMap<>();    //the game that first reached each team
 
         while (!queue.isEmpty()) {
             String current = queue.poll();    //First item of the queue
 
             if (current.equals(endTeam)) {
-                return buildPath(cameFrom, startTeam, endTeam);    //success case
+                return buildChain(cameFrom, startTeam, endTeam);    //success case
             }
 
-            for (String beaten : winsGraph.getOrDefault(current, List.of())) {
-                if (!visited.contains(beaten)) {      //make sure we havent seen this team, can cause infinite loop
-                    visited.add(beaten);
-                    cameFrom.put(beaten, current);
-                    queue.add(beaten);
+            for (ChainGame game : graph.getOrDefault(current, List.of())) {
+                if (!visited.contains(game.loser())) {      //make sure we havent seen this team, can cause infinite loop
+                    visited.add(game.loser());
+                    cameFrom.put(game.loser(), game);
+                    queue.add(game.loser());
                 }
             }
         }
-        return new ArrayList<>();    //failure to find path
+        return new ArrayList<>();    //failure to find chain
     }
 
-    // Walks cameFrom back from endTeam to startTeam, then reverses it so the path reads start -> end.
-    private List<String> buildPath(Map<String, String> cameFrom, String startTeam, String endTeam) {
-        List<String> path = new ArrayList<>();
+    // Walks cameFrom back from endTeam to startTeam, then reverses it so the games read start -> end.
+    private List<ChainGame> buildChain(Map<String, ChainGame> cameFrom, String startTeam, String endTeam) {
+        List<ChainGame> chain = new ArrayList<>();
         String current = endTeam;
         while (!current.equals(startTeam)) {
-            path.add(current);
-            current = cameFrom.get(current);
+            ChainGame game = cameFrom.get(current);
+            chain.add(game);
+            current = game.winner();
         }
-        path.add(startTeam);
-        Collections.reverse(path);
-        return path;
+        Collections.reverse(chain);
+        return chain;
     }
 
-    // Returns a copy of winsGraph sorted by team name.
+    // Returns each team and the teams it has beaten, sorted by team name.
     public Map<String, List<String>> getWinsGraph() {
-        return new TreeMap<>(winsGraph);
+        Map<String, List<String>> sorted = new TreeMap<>();
+        winsGraph.forEach((winner, games) -> sorted.put(winner, games.stream().map(ChainGame::loser).toList()));
+        return sorted;
     }
 
-    private void addWin(String winner, String loser) {
-        winsGraph.computeIfAbsent(winner, team -> new ArrayList<>()).add(loser);
+    private static void addWin(Map<String, List<ChainGame>> graph, ChainGame game) {
+        graph.computeIfAbsent(game.winner(), team -> new ArrayList<>()).add(game);
     }
 }
-

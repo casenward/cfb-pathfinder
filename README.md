@@ -6,8 +6,9 @@ For example: **Alabama beat Kentucky beat Oklahoma beat Texas beat Ohio State**.
 
 ## How it works
 
-- On startup, the backend pulls every completed game of the current season from the [College Football Data API](https://collegefootballdata.com) and builds a graph where each team points to the teams it has beaten.
+- On startup, and every Monday at 6 AM Eastern, the backend pulls every completed FBS-vs-FBS game of the season from the [College Football Data API](https://collegefootballdata.com) and builds a graph where each team points to the teams it has beaten.
 - A breadth-first search over that graph finds the shortest chain of wins from the starting team to the target team.
+- The season defaults to 2026. Set `SEASON=<year>` in `.env` to change it.
 
 ## Tech stack
 
@@ -35,7 +36,8 @@ For example: **Alabama beat Kentucky beat Oklahoma beat Texas beat Ohio State**.
 
 | Endpoint | Description |
 |---|---|
-| `GET /api/path?start=<team>&end=<team>` | Returns `{"path": [...]}`, the shortest chain of wins, or an empty list if none exists. |
-| `GET /` | Returns the full wins graph as JSON. |
+| `GET /api/teams` | FBS team names, sorted A to Z. |
+| `GET /api/chain?start=<team>&target=<team>` | The games in the shortest chain of wins, in order, or an empty list if none exists. Each game has `winner`, `loser`, `winnerPoints`, `loserPoints` and `date` (e.g. `2026-10-04`, US Eastern). |
+| `GET /` | The full wins graph as JSON, for debugging. |
 
-Team names must match the API's spelling and capitalization exactly (e.g. `Ohio State`, `Texas A&M`).
+The frontend only talks to these endpoints, so the CFBD API key never leaves the server.
